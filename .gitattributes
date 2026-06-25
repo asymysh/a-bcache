@@ -1,0 +1,16 @@
+# Force LF line endings for files that must work on Linux,
+# regardless of the platform git is running on.
+
+*.c       text eol=lf
+*.h       text eol=lf
+*.sh      text eol=lf
+Makefile  text eol=lf
+*.service text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.rules   text eol=lf
+*.8       text eol=lf
+
+# Binary patterns
+*.o       binary
+*.png     binary

@@ -3,5 +3,15 @@
 /bcache-register
 /make-bcache
 /probe-bcache
-.*
+/a-bcached
 /*.o
+
+# Editor and OS temp files
+.*.swp
+.DS_Store
+*~
+
+# But allow dotfiles we ship
+!.gitignore
+!.gitattributes
+!.github/

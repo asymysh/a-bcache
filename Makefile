@@ -31,4 +31,4 @@ bcache-super-show: CFLAGS += -std=gnu99
 bcache-super-show: bcache.o
 bcache-register: bcache-register.o
 a-bcached: a-bcached.c
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)

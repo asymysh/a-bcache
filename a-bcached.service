@@ -2,26 +2,33 @@
 Description=a-bcache HDD spin management daemon
 Documentation=https://github.com/asymysh/a-bcache
 After=local-fs.target
-Requires=local-fs.target
+Wants=local-fs.target
 
 [Service]
-Type=forking
+# Type=simple with --foreground avoids the PIDFile tracking problems
+# associated with Type=forking.
+Type=simple
 ExecStart=/usr/sbin/a-bcached \
+    --foreground \
     --spindown-delay 300 \
     --min-writeback 64 \
     --poll-interval 5 \
     --max-spin-cycles 4
-ExecStop=/bin/kill -TERM $MAINPID
+
 Restart=on-failure
 RestartSec=10
 
-# Security hardening
-ProtectSystem=strict
+# Runs as root because hdparm needs CAP_SYS_RAWIO and writes to bcache
+# sysfs control files. Note: we cannot set ProtectKernelTunables=true
+# because that makes /sys read-only, which would break sysfs writes.
+PrivateTmp=true
 ProtectHome=true
-ReadWritePaths=/sys/block /sys/fs/bcache
-NoNewPrivileges=false
-# Needs CAP_SYS_RAWIO for hdparm, CAP_DAC_OVERRIDE for sysfs writes
-AmbientCapabilities=CAP_SYS_RAWIO CAP_DAC_OVERRIDE
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

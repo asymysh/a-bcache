@@ -3,20 +3,27 @@
 # test-spin-management.sh - Integration test for a-bcached spin management
 #
 # Tests:
-#   1. Dirty data accumulation pauses writeback (HDD stays down)
-#   2. Dirty data threshold triggers writeback (HDD spins up)
-#   3. Idle timeout triggers spin-down
-#   4. Spin cycle budget is respected
-#   5. Sequential write pattern verification
+#   1. sysfs interface is readable
+#   2. writeback can be paused/resumed
+#   3. dirty data accumulation works
+#   4. a-bcached daemon discovers devices and produces output
+#   5. /sys/block/<backing>/stat is readable for I/O monitoring
+#   6. hdparm presence (spin detection requires real HDD)
 #
 # Prerequisites: run setup-mock-devices.sh first
 #
 # Usage: sudo ./test/test-spin-management.sh
 #
 
-set -euo pipefail
+# NOTE: We deliberately do NOT use `set -e` because shell arithmetic
+# `((PASS++))` returns the pre-increment value, which is 0 on the first
+# pass and would otherwise terminate the script under `set -e`.
+set -uo pipefail
 
 MOCK_DIR="/tmp/a-bcache-test"
+DAEMON_BIN="./a-bcached"
+LOG_FILE="$(mktemp -t a-bcached-test.XXXXXX.log)"
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -26,213 +33,254 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-pass() { echo -e "  ${GREEN}PASS${NC}: $*"; ((PASS++)); }
-fail() { echo -e "  ${RED}FAIL${NC}: $*"; ((FAIL++)); }
-skip() { echo -e "  ${YELLOW}SKIP${NC}: $*"; ((SKIP++)); }
+pass() { printf '  %bPASS%b: %s\n' "$GREEN"  "$NC" "$*"; PASS=$((PASS + 1)); }
+fail() { printf '  %bFAIL%b: %s\n' "$RED"    "$NC" "$*"; FAIL=$((FAIL + 1)); }
+skip() { printf '  %bSKIP%b: %s\n' "$YELLOW" "$NC" "$*"; SKIP=$((SKIP + 1)); }
 
-# Check prerequisites
+cleanup() {
+    rm -f "$LOG_FILE"
+}
+trap cleanup EXIT
+
 check_prereqs() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "Must run as root"
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        echo "Must run as root" >&2
         exit 1
     fi
 
-    if ! ls /sys/block/bcache* &>/dev/null; then
-        echo "No bcache devices found. Run setup-mock-devices.sh first."
+    if [[ ! -d /sys/fs/bcache ]]; then
+        echo "bcache module not loaded; run setup-mock-devices.sh first" >&2
         exit 1
     fi
 
-    if [[ ! -x "./a-bcached" ]]; then
-        echo "a-bcached not built. Run 'make' first."
+    if ! compgen -G "/sys/block/bcache*/bcache" > /dev/null; then
+        echo "No bcache devices found; run setup-mock-devices.sh first" >&2
+        exit 1
+    fi
+
+    if [[ ! -x "$DAEMON_BIN" ]]; then
+        echo "$DAEMON_BIN not built or not executable. Run 'make' first." >&2
         exit 1
     fi
 }
 
+# Return the first bcache control directory found (no hard-coding bcache0)
 get_bcache_sysfs() {
-    echo "/sys/block/bcache0/bcache"
+    local b
+    for b in /sys/block/bcache*/bcache; do
+        if [[ -d "$b" ]]; then
+            echo "$b"
+            return 0
+        fi
+    done
+    return 1
 }
 
-get_dirty_data() {
-    cat "$(get_bcache_sysfs)/dirty_data" 2>/dev/null || echo "0.0k"
-}
-
-get_writeback_running() {
-    cat "$(get_bcache_sysfs)/writeback_running" 2>/dev/null || echo "1"
+# Return the device path /dev/bcacheN matching the sysfs we picked
+get_bcache_dev() {
+    local sysfs name
+    sysfs=$(get_bcache_sysfs) || return 1
+    name=$(basename "$(dirname "$sysfs")")
+    echo "/dev/$name"
 }
 
 #
-# Test 1: Verify sysfs interface works
+# Test 1: sysfs interface readable
 #
 test_sysfs_readable() {
     echo "Test 1: sysfs interface readable"
     local sysfs
-    sysfs=$(get_bcache_sysfs)
-
-    if [[ -f "$sysfs/dirty_data" ]]; then
-        pass "dirty_data readable: $(cat "$sysfs/dirty_data")"
-    else
-        fail "dirty_data not found at $sysfs/dirty_data"
+    if ! sysfs=$(get_bcache_sysfs); then
+        fail "no bcache control directory found"
+        return
     fi
 
-    if [[ -f "$sysfs/state" ]]; then
-        pass "state readable: $(cat "$sysfs/state")"
-    else
-        fail "state not found"
-    fi
-
-    if [[ -f "$sysfs/cache_mode" ]]; then
-        pass "cache_mode readable: $(cat "$sysfs/cache_mode")"
-    else
-        fail "cache_mode not found"
-    fi
-
-    if [[ -f "$sysfs/writeback_running" ]]; then
-        pass "writeback_running readable: $(get_writeback_running)"
-    else
-        fail "writeback_running not found"
-    fi
+    local attr
+    for attr in dirty_data state cache_mode writeback_running; do
+        if [[ -r "$sysfs/$attr" ]]; then
+            pass "$attr readable: $(cat "$sysfs/$attr")"
+        else
+            fail "$attr not readable at $sysfs/$attr"
+        fi
+    done
 }
 
 #
-# Test 2: Writeback can be paused/resumed via sysfs
+# Test 2: Writeback pause/resume via sysfs
 #
 test_writeback_control() {
     echo "Test 2: writeback pause/resume"
     local sysfs
-    sysfs=$(get_bcache_sysfs)
-
-    # Pause writeback
-    echo 0 > "$sysfs/writeback_running"
-    if [[ $(cat "$sysfs/writeback_running") == "0" ]]; then
-        pass "writeback paused successfully"
-    else
-        fail "writeback pause failed"
-    fi
-
-    # Resume writeback
-    echo 1 > "$sysfs/writeback_running"
-    if [[ $(cat "$sysfs/writeback_running") == "1" ]]; then
-        pass "writeback resumed successfully"
-    else
-        fail "writeback resume failed"
-    fi
-}
-
-#
-# Test 3: Generate dirty data by writing to bcache device
-#
-test_dirty_data_generation() {
-    echo "Test 3: dirty data generation"
-
-    if [[ ! -b /dev/bcache0 ]]; then
-        skip "bcache0 not available"
+    if ! sysfs=$(get_bcache_sysfs); then
+        fail "no bcache control directory"
         return
     fi
 
-    # Pause writeback so dirty data accumulates
-    echo 0 > "$(get_bcache_sysfs)/writeback_running"
-
-    # Write 8MB of data to the bcache device
-    dd if=/dev/urandom of=/dev/bcache0 bs=1M count=8 oflag=direct 2>/dev/null
-
-    sleep 1
-    local dirty
-    dirty=$(get_dirty_data)
-
-    if [[ "$dirty" != "0.0k" && "$dirty" != "0" ]]; then
-        pass "dirty data accumulated: $dirty"
+    if ! printf '0\n' > "$sysfs/writeback_running" 2>/dev/null; then
+        fail "cannot write to writeback_running"
+        return
+    fi
+    if [[ "$(cat "$sysfs/writeback_running")" == "0" ]]; then
+        pass "writeback paused"
     else
-        fail "dirty data not accumulated (got: $dirty)"
+        fail "writeback pause did not take effect"
     fi
 
-    # Resume writeback
-    echo 1 > "$(get_bcache_sysfs)/writeback_running"
+    printf '1\n' > "$sysfs/writeback_running" 2>/dev/null || true
+    if [[ "$(cat "$sysfs/writeback_running")" == "1" ]]; then
+        pass "writeback resumed"
+    else
+        fail "writeback resume did not take effect"
+    fi
 }
 
 #
-# Test 4: a-bcached dry-run mode
+# Test 3: Generate dirty data by writing to /dev/bcacheN
+#
+test_dirty_data_generation() {
+    echo "Test 3: dirty data generation"
+    local sysfs bcache_dev
+    sysfs=$(get_bcache_sysfs) || { fail "no bcache sysfs"; return; }
+    bcache_dev=$(get_bcache_dev) || { skip "no bcache device path"; return; }
+
+    if [[ ! -b "$bcache_dev" ]]; then
+        skip "$bcache_dev is not a block device"
+        return
+    fi
+
+    # Pause writeback so dirty data accumulates instead of being flushed
+    printf '0\n' > "$sysfs/writeback_running" 2>/dev/null || true
+
+    # /dev/zero is much faster than /dev/urandom; bcache doesn't deduplicate
+    # zeros so it still produces dirty data.
+    if ! dd if=/dev/zero of="$bcache_dev" bs=1M count=8 \
+        conv=fsync oflag=direct status=none 2>/dev/null; then
+        # Some setups don't allow O_DIRECT; retry without
+        if ! dd if=/dev/zero of="$bcache_dev" bs=1M count=8 \
+            conv=fsync status=none 2>/dev/null; then
+            fail "dd write to $bcache_dev failed"
+            printf '1\n' > "$sysfs/writeback_running" 2>/dev/null || true
+            return
+        fi
+    fi
+
+    # Poll up to 5 seconds for dirty_data to update
+    local dirty="0.0k"
+    local i
+    for i in 1 2 3 4 5; do
+        dirty=$(cat "$sysfs/dirty_data" 2>/dev/null || echo "0.0k")
+        # Match anything that's not zero or "0.0k"
+        if [[ -n "$dirty" && "$dirty" != "0" && "$dirty" != "0.0k" ]]; then
+            pass "dirty data accumulated: $dirty"
+            printf '1\n' > "$sysfs/writeback_running" 2>/dev/null || true
+            return
+        fi
+        sleep 1
+    done
+
+    fail "dirty data did not accumulate (last value: $dirty)"
+    printf '1\n' > "$sysfs/writeback_running" 2>/dev/null || true
+}
+
+#
+# Test 4: a-bcached dry-run mode discovers devices and produces output
 #
 test_daemon_dryrun() {
     echo "Test 4: a-bcached dry-run mode"
 
-    # Run daemon in dry-run + foreground, kill after 3 seconds
-    timeout 3 ./a-bcached -f -n -v 2>&1 | tee /tmp/a-bcached-test.log &
+    # Run with timeout. Use a single command in background so $! is the
+    # daemon's PID, not tee's.
+    rm -f "$LOG_FILE"
+    timeout --preserve-status 3 "$DAEMON_BIN" -f -n -v \
+        > "$LOG_FILE" 2>&1 &
     local pid=$!
 
-    sleep 3
-    kill "$pid" 2>/dev/null || true
+    # Wait for completion (timeout will terminate after 3s)
     wait "$pid" 2>/dev/null || true
 
-    if grep -q "Found.*bcache device" /tmp/a-bcached-test.log; then
-        pass "daemon found bcache devices"
-    else
-        fail "daemon did not find bcache devices"
+    if [[ ! -s "$LOG_FILE" ]]; then
+        fail "daemon produced no output"
+        return
     fi
 
-    if grep -q "DRY-RUN\|spinning down\|holding\|writeback" /tmp/a-bcached-test.log; then
+    if grep -q "Found.*bcache device" "$LOG_FILE"; then
+        pass "daemon discovered bcache devices"
+    else
+        fail "daemon did not discover bcache devices"
+        echo "    --- daemon output ---"
+        sed 's/^/    /' "$LOG_FILE"
+        echo "    --- end output ---"
+    fi
+
+    if grep -qE "DRY-RUN|spinning down|holding|writeback|spinning, idle" "$LOG_FILE"; then
         pass "daemon produced spin management output"
     else
         fail "daemon produced no spin management output"
+        echo "    --- daemon output ---"
+        sed 's/^/    /' "$LOG_FILE"
+        echo "    --- end output ---"
     fi
-
-    rm -f /tmp/a-bcached-test.log
 }
 
 #
-# Test 5: I/O pattern monitoring (verify backing device sees sequential writes)
+# Test 5: I/O stats readable on backing device
 #
 test_io_pattern() {
-    echo "Test 5: I/O pattern on backing device"
+    echo "Test 5: I/O stats on backing device"
 
-    if [[ ! -f "$MOCK_DIR/hdd.loop" ]]; then
-        skip "mock HDD loop not found"
+    if [[ ! -f "$MOCK_DIR/hdd.dev" ]]; then
+        skip "mock HDD device path not recorded"
         return
     fi
 
-    local hdd_loop
-    hdd_loop=$(cat "$MOCK_DIR/hdd.loop")
-    local devname
-    devname=$(basename "$hdd_loop")
+    local hdd_dev devname
+    hdd_dev=$(cat "$MOCK_DIR/hdd.dev")
+    devname=$(basename "$hdd_dev")
 
-    # Read I/O stats before
-    local before
-    before=$(cat "/sys/block/$devname/stat" 2>/dev/null)
-
-    if [[ -n "$before" ]]; then
-        pass "can read I/O stats from /sys/block/$devname/stat"
-
-        # The stat fields we care about:
-        # Field 3: sectors read
-        # Field 7: sectors written
-        local sectors_read sectors_written
-        sectors_read=$(echo "$before" | awk '{print $3}')
-        sectors_written=$(echo "$before" | awk '{print $7}')
-
-        echo "    backing device stats: read=${sectors_read}s written=${sectors_written}s"
-    else
-        skip "cannot read I/O stats for $devname"
+    # dm device: /sys/block/dm-N -- for dm-delay name dispatch, find it
+    if [[ "$hdd_dev" =~ ^/dev/mapper/ ]]; then
+        local dmname
+        dmname=$(basename "$hdd_dev")
+        # /sys/block/dm-N exists; dm name is in /sys/block/dm-N/dm/name
+        local dm
+        for dm in /sys/block/dm-*/dm/name; do
+            if [[ -r "$dm" ]] && [[ "$(cat "$dm")" == "$dmname" ]]; then
+                devname=$(basename "$(dirname "$(dirname "$dm")")")
+                break
+            fi
+        done
     fi
+
+    local stat_file="/sys/block/$devname/stat"
+    if [[ ! -r "$stat_file" ]]; then
+        skip "cannot read $stat_file"
+        return
+    fi
+
+    local stat_line
+    stat_line=$(cat "$stat_file")
+    if [[ -z "$stat_line" ]]; then
+        fail "$stat_file is empty"
+        return
+    fi
+
+    pass "I/O stats readable for $devname"
+
+    local reads writes
+    reads=$(echo "$stat_line"  | awk '{print $3}')  # read_sectors
+    writes=$(echo "$stat_line" | awk '{print $7}')  # write_sectors
+    echo "    backing device $devname: read=${reads}s written=${writes}s"
 }
 
 #
-# Test 6: Spin state detection (mock - hdparm may not work on loop devices)
+# Test 6: hdparm availability (spin detection requires real HDD)
 #
 test_spin_detection() {
-    echo "Test 6: spin state detection"
+    echo "Test 6: hdparm availability"
 
-    if [[ ! -f "$MOCK_DIR/hdd.loop" ]]; then
-        skip "mock HDD not found"
-        return
-    fi
-
-    local hdd_loop
-    hdd_loop=$(cat "$MOCK_DIR/hdd.loop")
-
-    # hdparm -C won't work on loop devices, but we verify the command exists
-    if command -v hdparm &>/dev/null; then
-        pass "hdparm available for spin management"
-        # On real hardware: hdparm -C /dev/sdX would return active/standby
-        skip "spin detection not testable on loop devices (need real HDD)"
+    if command -v hdparm >/dev/null 2>&1; then
+        pass "hdparm is installed"
+        skip "spin state detection not testable on loop devices (need real ATA HDD)"
     else
         skip "hdparm not installed"
     fi
@@ -260,7 +308,8 @@ test_spin_detection
 
 echo ""
 echo "============================================"
-echo -e "  Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}, ${YELLOW}${SKIP} skipped${NC}"
+printf "  Results: %b%d passed%b, %b%d failed%b, %b%d skipped%b\n" \
+    "$GREEN" "$PASS" "$NC" "$RED" "$FAIL" "$NC" "$YELLOW" "$SKIP" "$NC"
 echo "============================================"
 
-exit $FAIL
+exit "$FAIL"

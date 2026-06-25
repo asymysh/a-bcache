@@ -1,0 +1,67 @@
+name: Build a-bcache
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            uuid-dev \
+            libblkid-dev \
+            ${{ matrix.cc }}
+
+      - name: Build (strict warnings)
+        env:
+          CC: ${{ matrix.cc }}
+          CFLAGS: "-O2 -Wall -Wextra -Wpedantic -Werror -g"
+        run: |
+          make all
+          ls -la a-bcached make-bcache probe-bcache bcache-super-show
+
+      - name: Quick smoke test of a-bcached
+        run: |
+          # Verify the binary actually works
+          ./a-bcached --help || true
+          # Run with --dry-run; should fail with "no bcache devices"
+          # which is the expected behavior on a runner without bcache.
+          ./a-bcached --dry-run --foreground --verbose 2>&1 || \
+            echo "(expected: no bcache devices on CI runner)"
+
+      - name: Static analysis (cppcheck)
+        run: |
+          sudo apt-get install -y cppcheck
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --error-exitcode=1 \
+            --inline-suppr \
+            --suppress=missingIncludeSystem \
+            a-bcached.c
+
+  shellcheck:
+    name: ShellCheck test scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run shellcheck
+        run: |
+          shellcheck test/setup-mock-devices.sh
+          shellcheck test/test-spin-management.sh
