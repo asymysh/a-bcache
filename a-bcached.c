@@ -202,8 +202,11 @@ static int sysfs_write_uint(const char *path, unsigned val)
 
 /*
  * Build a sysfs path safely, returning -ENAMETOOLONG on truncation.
+ * Marked with printf format attribute so the compiler checks callers
+ * and doesn't flag the indirect format string passed to vsnprintf.
  */
-static int build_path(char *out, size_t out_len, const char *fmt, ...)
+static int __attribute__((format(printf, 3, 4)))
+build_path(char *out, size_t out_len, const char *fmt, ...)
 {
 	va_list ap;
 	int n;
