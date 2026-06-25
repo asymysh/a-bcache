@@ -37,6 +37,7 @@ pass() { printf '  %bPASS%b: %s\n' "$GREEN"  "$NC" "$*"; PASS=$((PASS + 1)); }
 fail() { printf '  %bFAIL%b: %s\n' "$RED"    "$NC" "$*"; FAIL=$((FAIL + 1)); }
 skip() { printf '  %bSKIP%b: %s\n' "$YELLOW" "$NC" "$*"; SKIP=$((SKIP + 1)); }
 
+# shellcheck disable=SC2317  # invoked indirectly via trap
 cleanup() {
     rm -f "$LOG_FILE"
 }
@@ -166,8 +167,8 @@ test_dirty_data_generation() {
 
     # Poll up to 5 seconds for dirty_data to update
     local dirty="0.0k"
-    local i
-    for i in 1 2 3 4 5; do
+    local _attempt
+    for _attempt in 1 2 3 4 5; do
         dirty=$(cat "$sysfs/dirty_data" 2>/dev/null || echo "0.0k")
         # Match anything that's not zero or "0.0k"
         if [[ -n "$dirty" && "$dirty" != "0" && "$dirty" != "0.0k" ]]; then

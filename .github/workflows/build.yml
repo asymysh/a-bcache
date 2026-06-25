@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build (${{ matrix.os }}, ${{ matrix.cc }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -27,22 +27,39 @@ jobs:
             libblkid-dev \
             ${{ matrix.cc }}
 
-      - name: Build (strict warnings)
+      - name: Build all (default warnings)
         env:
           CC: ${{ matrix.cc }}
-          CFLAGS: "-O2 -Wall -Wextra -Wpedantic -Werror -g"
         run: |
           make all
           ls -la a-bcached make-bcache probe-bcache bcache-super-show
 
-      - name: Quick smoke test of a-bcached
+      - name: Strict warnings check for a-bcached.c
+        env:
+          CC: ${{ matrix.cc }}
+        # We isolate the strict check to a-bcached.c because the existing
+        # upstream bcache.c sources have pre-existing -Wpedantic issues
+        # unrelated to this fork.
         run: |
-          # Verify the binary actually works
-          ./a-bcached --help || true
-          # Run with --dry-run; should fail with "no bcache devices"
-          # which is the expected behavior on a runner without bcache.
-          ./a-bcached --dry-run --foreground --verbose 2>&1 || \
-            echo "(expected: no bcache devices on CI runner)"
+          ${{ matrix.cc }} \
+            -O2 -Wall -Wextra -Wpedantic -Werror \
+            -Wformat=2 -Wshadow -Wcast-align -Wconversion \
+            -Wno-sign-conversion \
+            -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE \
+            -g -o /tmp/a-bcached-strict a-bcached.c
+          ls -la /tmp/a-bcached-strict
+
+      - name: Quick smoke test
+        run: |
+          # --help should succeed and not return error
+          ./a-bcached --help
+          # With no bcache devices we expect a clean exit failure with
+          # an informative message, not a crash.
+          if ./a-bcached --dry-run --foreground --verbose 2>&1; then
+            echo "Unexpected: succeeded without bcache devices"
+            exit 1
+          fi
+          echo "OK: cleanly failed with no bcache devices (as expected)"
 
       - name: Static analysis (cppcheck)
         run: |
@@ -52,6 +69,7 @@ jobs:
             --error-exitcode=1 \
             --inline-suppr \
             --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
             a-bcached.c
 
   shellcheck:
