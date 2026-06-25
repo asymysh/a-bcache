@@ -40,12 +40,13 @@ jobs:
         # We isolate the strict check to a-bcached.c because the existing
         # upstream bcache.c sources have pre-existing -Wpedantic issues
         # unrelated to this fork.
+        # Feature-test macros (_GNU_SOURCE, _FILE_OFFSET_BITS) are defined
+        # inside a-bcached.c itself.
         run: |
           ${{ matrix.cc }} \
             -O2 -Wall -Wextra -Wpedantic -Werror \
             -Wformat=2 -Wshadow -Wcast-align -Wconversion \
             -Wno-sign-conversion \
-            -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE \
             -g -o /tmp/a-bcached-strict a-bcached.c
           ls -la /tmp/a-bcached-strict
 
