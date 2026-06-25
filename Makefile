@@ -4,6 +4,9 @@ UDEVLIBDIR=/lib/udev
 DRACUTLIBDIR=/lib/dracut
 INSTALL=install
 CFLAGS+=-O2 -Wall -g
+# Upstream bcache.c uses pre-C99 inline semantics (inline crc64 referencing
+# a static crc_table). -fgnu89-inline restores that behavior on modern compilers.
+CFLAGS+=-fgnu89-inline
 
 all: make-bcache probe-bcache bcache-super-show bcache-register a-bcached
 
