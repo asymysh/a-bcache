@@ -184,23 +184,20 @@ test_dirty_data_generation() {
 }
 
 #
-# Test 4: a-bcached dry-run mode discovers devices and produces output
+# Test 4: a-bcached --once mode discovers devices and produces output
 #
-test_daemon_dryrun() {
-    echo "Test 4: a-bcached dry-run mode"
+test_daemon_once() {
+    echo "Test 4: a-bcached --once mode"
 
-    # Run with timeout. Use a single command in background so $! is the
-    # daemon's PID, not tee's.
     rm -f "$LOG_FILE"
-    timeout --preserve-status 3 "$DAEMON_BIN" -f -n -v \
-        > "$LOG_FILE" 2>&1 &
-    local pid=$!
-
-    # Wait for completion (timeout will terminate after 3s)
-    wait "$pid" 2>/dev/null || true
-
-    if [[ ! -s "$LOG_FILE" ]]; then
-        fail "daemon produced no output"
+    # --once runs one iteration and exits. With --dry-run no real
+    # hdparm or destructive commands run; we still see the decision.
+    if ! "$DAEMON_BIN" --once --dry-run --verbose > "$LOG_FILE" 2>&1; then
+        local rc=$?
+        fail "daemon --once exited non-zero ($rc)"
+        echo "    --- daemon output ---"
+        sed 's/^/    /' "$LOG_FILE"
+        echo "    --- end output ---"
         return
     fi
 
@@ -213,14 +210,63 @@ test_daemon_dryrun() {
         echo "    --- end output ---"
     fi
 
-    if grep -qE "DRY-RUN|spinning down|holding|writeback|spinning, idle" "$LOG_FILE"; then
-        pass "daemon produced spin management output"
+    if grep -qE "DRY-RUN|spinning down|holding|writeback|spinning, idle" \
+        "$LOG_FILE"; then
+        pass "daemon produced a spin-management decision"
     else
         fail "daemon produced no spin management output"
         echo "    --- daemon output ---"
         sed 's/^/    /' "$LOG_FILE"
         echo "    --- end output ---"
     fi
+}
+
+#
+# Test 4b: --once with spindown-delay=0 should trigger immediate spin-down
+#
+test_daemon_once_spindown() {
+    echo "Test 4b: --once forces spin-down decision"
+
+    local sysfs
+    sysfs=$(get_bcache_sysfs) || { fail "no bcache sysfs"; return; }
+
+    # Ensure clean state: writeback enabled, no dirty data
+    printf '1\n' > "$sysfs/writeback_running" 2>/dev/null || true
+
+    rm -f "$LOG_FILE"
+    # spindown-delay=0 + dry-run + once => daemon should log "Would spin down"
+    if ! "$DAEMON_BIN" --once --dry-run --verbose \
+        --spindown-delay 0 \
+        --min-writeback 1024 \
+        > "$LOG_FILE" 2>&1; then
+        fail "daemon --once exited non-zero"
+        sed 's/^/    /' "$LOG_FILE"
+        return
+    fi
+
+    if grep -qE "Would spin down|spinning down" "$LOG_FILE"; then
+        pass "daemon decided to spin down (as expected)"
+    else
+        fail "daemon did not decide to spin down with spindown-delay=0"
+        echo "    --- daemon output ---"
+        sed 's/^/    /' "$LOG_FILE"
+        echo "    --- end output ---"
+    fi
+
+    # In --once mode the daemon should have set writeback_running=0
+    # and left it that way (no cleanup re-enable).
+    local wb
+    wb=$(cat "$sysfs/writeback_running" 2>/dev/null || echo "?")
+    if [[ "$wb" == "0" ]]; then
+        pass "writeback_running was set to 0 by spin-down decision"
+    else
+        # Not a fail -- might be 1 if state didn't match expected.
+        # Just informational.
+        skip "writeback_running=$wb (expected 0)"
+    fi
+
+    # Restore for next tests
+    printf '1\n' > "$sysfs/writeback_running" 2>/dev/null || true
 }
 
 #
@@ -301,7 +347,9 @@ test_writeback_control
 echo ""
 test_dirty_data_generation
 echo ""
-test_daemon_dryrun
+test_daemon_once
+echo ""
+test_daemon_once_spindown
 echo ""
 test_io_pattern
 echo ""

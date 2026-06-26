@@ -75,7 +75,19 @@ struct spin_state {
 	unsigned	spin_cycles_this_hour;
 	time_t		hour_start;
 	struct io_stats	prev_stats;
+
+	/*
+	 * Cache of last writeback_running value we wrote, so we can skip
+	 * redundant sysfs writes. -1 means "unknown / never written".
+	 */
+	int		last_wb_running;
+
+	/* Consecutive sysfs read failures; used to back off polling */
+	unsigned	consecutive_errors;
 };
+
+/* Skip a device after this many consecutive sysfs read failures */
+#define MAX_CONSECUTIVE_ERRORS	10
 
 struct abcache_config {
 	unsigned	spindown_delay_secs;
@@ -85,6 +97,7 @@ struct abcache_config {
 	unsigned	writeback_rate;
 	bool		dry_run;
 	bool		foreground;
+	bool		once;		/* Run one iteration and exit */
 	int		log_level;
 };
 
@@ -104,6 +117,17 @@ struct bcache_device {
 static volatile sig_atomic_t	g_running	= 1;
 static bool			g_use_syslog	= false;
 static int			g_log_level	= VERB_INFO;
+
+/*
+ * Whether the hdparm tool is available on the system.
+ * Cached at startup; if false, all spin-state queries and spin-down
+ * commands are skipped (we just manage writeback).
+ */
+static bool			g_have_hdparm	= false;
+
+/* Timeouts wrapped around hdparm invocations (seconds) */
+#define HDPARM_CHECK_TIMEOUT	5
+#define HDPARM_SPINDOWN_TIMEOUT	10
 
 /*
  * ===========================================================================
@@ -307,6 +331,24 @@ static int bcache_set_writeback_running(const char *sysfs_path, unsigned val)
 }
 
 /*
+ * Idempotent wrapper: only writes to sysfs if the value differs from
+ * the last value we set. Avoids redundant sysfs writes on every poll
+ * (which would create kernel log noise and pointless work).
+ */
+static int set_writeback_running_cached(struct bcache_device *dev, int val)
+{
+	int ret;
+
+	if (dev->spin.last_wb_running == val)
+		return 0;
+
+	ret = bcache_set_writeback_running(dev->sysfs_path, (unsigned)val);
+	if (ret == 0)
+		dev->spin.last_wb_running = val;
+	return ret;
+}
+
+/*
  * ===========================================================================
  *  Device path validation
  * ===========================================================================
@@ -338,7 +380,7 @@ static bool valid_dev_path(const char *path)
 
 static int hdd_spindown(const char *dev, bool dry_run)
 {
-	char cmd[PATH_MAX + 64];
+	char cmd[PATH_MAX + 128];
 	int ret;
 
 	if (!valid_dev_path(dev)) {
@@ -352,8 +394,20 @@ static int hdd_spindown(const char *dev, bool dry_run)
 		return 0;
 	}
 
+	if (!g_have_hdparm) {
+		log_msg(VERB_DEBUG,
+			"[a-bcached] hdparm unavailable, cannot spin down %s\n",
+			dev);
+		return -ENOENT;
+	}
+
+	/*
+	 * Wrap in `timeout` to bound execution. Some buggy USB-SATA
+	 * bridges have been known to hang hdparm indefinitely.
+	 */
 	ret = build_path(cmd, sizeof(cmd),
-			 "hdparm -y %s > /dev/null 2>&1", dev);
+			 "timeout %d hdparm -y %s > /dev/null 2>&1",
+			 HDPARM_SPINDOWN_TIMEOUT, dev);
 	if (ret)
 		return ret;
 
@@ -372,7 +426,7 @@ static int hdd_spindown(const char *dev, bool dry_run)
  */
 static int hdd_check_spinning(const char *dev)
 {
-	char cmd[PATH_MAX + 64];
+	char cmd[PATH_MAX + 128];
 	char buf[256];
 	FILE *fp;
 	int result = -1;
@@ -381,7 +435,12 @@ static int hdd_check_spinning(const char *dev)
 	if (!valid_dev_path(dev))
 		return -1;
 
-	ret = build_path(cmd, sizeof(cmd), "hdparm -C %s 2>/dev/null", dev);
+	if (!g_have_hdparm)
+		return -1;
+
+	ret = build_path(cmd, sizeof(cmd),
+			 "timeout %d hdparm -C %s 2>/dev/null",
+			 HDPARM_CHECK_TIMEOUT, dev);
 	if (ret)
 		return -1;
 
@@ -484,22 +543,42 @@ static void manage_device(struct bcache_device *dev,
 	int spinning;
 	int ret;
 
+	/*
+	 * Back off polling a device that has been failing consistently
+	 * (e.g., the user stopped it via /sys/.../bcache/stop). After a
+	 * threshold we just skip it; daemon restart will re-discover.
+	 */
+	if (dev->spin.consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+		log_msg(VERB_DEBUG,
+			"[a-bcached] %s: skipping (too many errors,"
+			" restart daemon to retry)\n",
+			dev->bcache_name);
+		return;
+	}
+
 	/* Read bcache dirty data and state. Skip device on any error. */
 	ret = bcache_get_dirty_data_bytes(dev->sysfs_path, &dirty_bytes);
 	if (ret) {
+		dev->spin.consecutive_errors++;
 		log_msg(VERB_DEBUG,
-			"[a-bcached] %s: dirty_data read failed (%d)\n",
-			dev->bcache_name, ret);
+			"[a-bcached] %s: dirty_data read failed (%d,"
+			" errors=%u)\n",
+			dev->bcache_name, ret, dev->spin.consecutive_errors);
 		return;
 	}
 
 	ret = bcache_get_state(dev->sysfs_path, state, sizeof(state));
 	if (ret) {
+		dev->spin.consecutive_errors++;
 		log_msg(VERB_DEBUG,
-			"[a-bcached] %s: state read failed (%d)\n",
-			dev->bcache_name, ret);
+			"[a-bcached] %s: state read failed (%d,"
+			" errors=%u)\n",
+			dev->bcache_name, ret, dev->spin.consecutive_errors);
 		return;
 	}
+
+	/* Successful reads: reset error counter */
+	dev->spin.consecutive_errors = 0;
 
 	/*
 	 * Only manage devices with an attached cache.
@@ -560,22 +639,38 @@ static void manage_device(struct bcache_device *dev,
 	if (dev->spin.is_spinning) {
 		/* HDD spinning: spin down if idle long enough and not much dirty */
 		if ((unsigned long)idle_secs >= cfg->spindown_delay_secs &&
-		    dirty_mb < cfg->min_writeback_mb) {
+		    dirty_mb < (uint64_t)cfg->min_writeback_mb) {
+			int sd_ret;
+
 			log_msg(VERB_INFO,
 				"[a-bcached] %s (%s): idle %lds, dirty %" PRIu64
 				"MB -- spinning down\n",
 				dev->bcache_name, dev->backing_dev,
 				idle_secs, dirty_mb);
 
-			bcache_set_writeback_running(dev->sysfs_path, 0);
-			hdd_spindown(dev->backing_dev, cfg->dry_run);
+			set_writeback_running_cached(dev, 0);
+			sd_ret = hdd_spindown(dev->backing_dev, cfg->dry_run);
 
-			dev->spin.is_spinning = false;
-			dev->spin.last_spindown_time = now;
-			dev->spin.spin_cycles_this_hour++;
+			if (sd_ret != 0 && !cfg->dry_run) {
+				log_msg(VERB_INFO,
+					"[a-bcached] %s: spin-down command"
+					" returned %d -- drive may not support"
+					" STANDBY or is busy\n",
+					dev->backing_dev, sd_ret);
+				/* Don't claim it's spun down; let next poll re-check */
+			} else {
+				/*
+				 * Optimistically mark as spun down. Next poll
+				 * will verify with hdparm -C and correct us
+				 * if necessary.
+				 */
+				dev->spin.is_spinning = false;
+				dev->spin.last_spindown_time = now;
+				dev->spin.spin_cycles_this_hour++;
+			}
 		} else if (dirty_mb > 0) {
 			/* Spinning + dirty: allow sequential writeback */
-			bcache_set_writeback_running(dev->sysfs_path, 1);
+			set_writeback_running_cached(dev, 1);
 			log_msg(VERB_DEBUG,
 				"[a-bcached] %s: spinning, dirty %" PRIu64
 				"MB, idle %lds -- writeback active\n",
@@ -588,7 +683,7 @@ static void manage_device(struct bcache_device *dev,
 		}
 	} else {
 		/* HDD spun down: keep writeback paused unless we must flush */
-		if (dirty_mb >= cfg->min_writeback_mb) {
+		if (dirty_mb >= (uint64_t)cfg->min_writeback_mb) {
 			if (dev->spin.spin_cycles_this_hour >=
 			    cfg->max_spin_cycles_hour) {
 				log_msg(VERB_INFO,
@@ -612,12 +707,12 @@ static void manage_device(struct bcache_device *dev,
 				bcache_set_writeback_rate(dev->sysfs_path,
 							  cfg->writeback_rate);
 
-			bcache_set_writeback_running(dev->sysfs_path, 1);
+			set_writeback_running_cached(dev, 1);
 			dev->spin.last_io_time = now;
 			dev->spin.last_spinup_time = now;
 			dev->spin.spin_cycles_this_hour++;
 		} else {
-			bcache_set_writeback_running(dev->sysfs_path, 0);
+			set_writeback_running_cached(dev, 0);
 			log_msg(VERB_DEBUG,
 				"[a-bcached] %s: spun down, dirty %" PRIu64
 				"MB < %uMB -- holding\n",
@@ -725,8 +820,29 @@ static int discover_bcache_devices(struct bcache_device *devs, int max_devs)
 		devs[count].spin.last_io_time = now;
 		devs[count].spin.stats_valid = false;
 		devs[count].spin.is_spinning = true;
+		devs[count].spin.last_wb_running = -1;
+		devs[count].spin.consecutive_errors = 0;
 
 		count++;
+	}
+
+	/*
+	 * If we exited the loop because of max_devs, there may be more
+	 * bcache devices we didn't manage. Warn the user.
+	 */
+	if (count == max_devs) {
+		while ((entry = readdir(dir)) != NULL) {
+			if (strncmp(entry->d_name, "bcache", 6) == 0 &&
+			    isdigit((unsigned char)entry->d_name[6])) {
+				fprintf(stderr,
+					"[a-bcached] Warning: found more "
+					"than %d bcache devices; %s and "
+					"others will not be managed. "
+					"Rebuild with a larger MAX_DEVICES.\n",
+					max_devs, entry->d_name);
+				break;
+			}
+		}
 	}
 
 	closedir(dir);
@@ -761,6 +877,8 @@ static void usage(FILE *out)
 			"(default: kernel)\n"
 		"  -n, --dry-run               Don't issue actual commands\n"
 		"  -f, --foreground            Don't daemonize (log to stderr)\n"
+		"  -o, --once                  Run one decision cycle and exit\n"
+		"                              (implies --foreground; for testing)\n"
 		"  -v, --verbose               Debug logging\n"
 		"  -q, --quiet                 No logging\n"
 		"  -h, --help                  Show this help and exit\n",
@@ -826,13 +944,14 @@ int main(int argc, char **argv)
 		{ "writeback-rate",	1, NULL, 'r' },
 		{ "dry-run",		0, NULL, 'n' },
 		{ "foreground",		0, NULL, 'f' },
+		{ "once",		0, NULL, 'o' },
 		{ "verbose",		0, NULL, 'v' },
 		{ "quiet",		0, NULL, 'q' },
 		{ "help",		0, NULL, 'h' },
 		{ NULL,			0, NULL,  0  },
 	};
 
-	while ((c = getopt_long(argc, argv, "s:m:p:c:r:nfvqh",
+	while ((c = getopt_long(argc, argv, "s:m:p:c:r:nfovqh",
 				opts, NULL)) != -1) {
 		switch (c) {
 		case 's':
@@ -876,6 +995,10 @@ int main(int argc, char **argv)
 		case 'f':
 			cfg.foreground = true;
 			break;
+		case 'o':
+			cfg.once = true;
+			cfg.foreground = true;	/* --once implies foreground */
+			break;
 		case 'v':
 			cfg.log_level = VERB_DEBUG;
 			break;
@@ -911,13 +1034,18 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	/* Soft-check for hdparm presence */
-	if (system("command -v hdparm > /dev/null 2>&1") != 0) {
+	/*
+	 * Probe for hdparm once at startup; cache result in g_have_hdparm.
+	 * If absent, all subsequent spin-state queries are skipped.
+	 */
+	g_have_hdparm = (system("command -v hdparm > /dev/null 2>&1") == 0);
+	if (!g_have_hdparm) {
 		fprintf(stderr,
-			"[a-bcached] Warning: hdparm not found in PATH; "
-			"HDD spin control will be unavailable.\n"
-			"[a-bcached]          Install with: apt install "
-			"hdparm  (or your distro's equivalent)\n");
+			"[a-bcached] Warning: hdparm not found in PATH;\n"
+			"[a-bcached]          HDD spin control will be"
+			" unavailable (writeback management still works).\n"
+			"[a-bcached]          Install with: apt install"
+			" hdparm  (or your distro's equivalent)\n");
 	}
 
 	g_log_level = cfg.log_level;
@@ -982,22 +1110,31 @@ int main(int argc, char **argv)
 	}
 
 	/* Main loop */
-	while (g_running) {
+	do {
 		for (i = 0; i < ndevices; i++)
 			manage_device(&devices[i], &cfg);
+
+		if (cfg.once)
+			break;
 
 		/*
 		 * sleep() returns early on SIGTERM/SIGINT (no SA_RESTART),
 		 * letting us exit promptly.
 		 */
 		sleep(cfg.poll_interval_secs);
-	}
+	} while (g_running);
 
-	/* Cleanup: re-enable writeback on exit so kernel keeps managing data */
-	log_msg(VERB_INFO,
-		"[a-bcached] Shutting down, re-enabling writeback\n");
-	for (i = 0; i < ndevices; i++)
-		bcache_set_writeback_running(devices[i].sysfs_path, 1);
+	/*
+	 * Cleanup: re-enable writeback on exit so the kernel keeps managing
+	 * data flushes. Skipped in --once mode so tests can observe the
+	 * daemon's actual decisions in sysfs.
+	 */
+	if (!cfg.once) {
+		log_msg(VERB_INFO,
+			"[a-bcached] Shutting down, re-enabling writeback\n");
+		for (i = 0; i < ndevices; i++)
+			bcache_set_writeback_running(devices[i].sysfs_path, 1);
+	}
 
 	if (g_use_syslog)
 		closelog();

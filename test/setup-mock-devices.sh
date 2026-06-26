@@ -48,7 +48,7 @@ check_bcache_module() {
 
 check_deps() {
     local missing=()
-    for cmd in losetup dd blkid; do
+    for cmd in losetup dd blkid wipefs; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -139,6 +139,13 @@ setup() {
     fi
     printf '%s\n' "$HDD_DEV" > "$MOCK_DIR/hdd.dev"
 
+    # Wipe any pre-existing filesystem signatures (ext4, LUKS, etc.)
+    # that would cause make-bcache to refuse. --wipe-bcache only handles
+    # bcache signatures, not other formats.
+    log "Wiping any existing signatures..."
+    wipefs -a "$SSD_LOOP" >/dev/null 2>&1 || true
+    wipefs -a "$HDD_DEV"  >/dev/null 2>&1 || true
+
     # Format devices for bcache
     log "Formatting mock SSD as bcache cache device..."
     if ! run_make_bcache -C "$SSD_LOOP" --bucket 128k --wipe-bcache; then
@@ -161,10 +168,12 @@ setup() {
         warn "/sys/fs/bcache/register not writable; udev may auto-register"
     fi
 
-    # Wait for /dev/bcacheN to appear and sysfs to populate
+    # Wait for both the sysfs control dir AND the /dev/bcacheN node
+    # to appear. udev may take a moment to create the device node.
     local tries=0
-    while [[ $tries -lt 20 ]]; do
-        if compgen -G "/sys/block/bcache*/bcache" > /dev/null; then
+    while [[ $tries -lt 30 ]]; do
+        if compgen -G "/sys/block/bcache*/bcache" > /dev/null && \
+           compgen -G "/dev/bcache*" > /dev/null; then
             break
         fi
         sleep 0.5
@@ -172,7 +181,10 @@ setup() {
     done
 
     if ! compgen -G "/sys/block/bcache*/bcache" > /dev/null; then
-        warn "No bcache devices appeared in /sys/block after 10s"
+        warn "No bcache devices appeared in /sys/block after 15s"
+    fi
+    if ! compgen -G "/dev/bcache*" > /dev/null; then
+        warn "No /dev/bcache* device node appeared after 15s -- udev may be slow"
     fi
 
     # Find the cache set UUID and attach it to all backing devices
